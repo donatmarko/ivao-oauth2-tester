@@ -9,19 +9,18 @@ from flask import Flask, request, redirect
 KEYRING_APPNAME = 'IVAOOAuth2FlowTester'
 CLIENT_ID = os.getenv('CLIENT_ID')
 CLIENT_SECRET = os.getenv('CLIENT_SECRET')
-REDIRECT_URI = 'http://localhost:51234/auth/callback'
-SCOPE = 'openid profile email discord location'
+REDIRECT_URI = 'http://localhost:41234/auth/callback'
+SCOPE = 'profile email discord location birthday'
+IVAO_VID = 540147
 
 OPENID_CONFIG_URL = 'https://api.ivao.aero/.well-known/openid-configuration'
 
-def get_openid_configuration():
-  response = requests.get(OPENID_CONFIG_URL)
-  if response.status_code == 200:
+def fetch_openid_config():
+    response = requests.get(OPENID_CONFIG_URL)
+    response.raise_for_status() 
     return response.json()
-  else:
-    raise Exception(f"Error fetching OpenID configuration: {response.status_code}")
 
-openid_config = get_openid_configuration()
+openid_config = fetch_openid_config()
 AUTHORIZATION_URL = openid_config['authorization_endpoint']
 TOKEN_URL = openid_config['token_endpoint']
 USERINFO_URL = openid_config['userinfo_endpoint']
@@ -30,83 +29,106 @@ app = Flask(__name__)
 
 @app.route('/')
 def index():
-  ivao_vid = '540147'
-  keyring_data = json.loads(keyring.get_password(KEYRING_APPNAME, ivao_vid) or '{}')
-  if not keyring_data:
-    # We don't have any keyring data associated to the VID in the envfile
-    print("Error: We don't have any keyring data associated to the VID in the envfile")
-    return redirect('/auth')
-  
-  if datetime.datetime.fromisoformat(keyring_data.get('expiresAt')) < datetime.datetime.now():
-    # access token expired
-    print("Error: Access token expired, refresh logic has not yet been implemented")
-    return "Error: Access token expired, refresh logic has not yet been implemented", 400
-  
-  response = requests.get(USERINFO_URL, headers={'Authorization': f'Bearer {keyring_data.get('accessToken')}'})
-  if response.status_code != 200:
-    return f"Error getting user info: {response.status_code}", 400
-  
-  print("Auth data successfully obtained from the keyring")
-  user_info = response.json()
-  return user_info
+    keyring_data = get_keyring_data(str(IVAO_VID))
+    if not keyring_data:
+        print("Error: No stored keyring data for the VID.")
+        return redirect('/auth')
 
+    try:
+        access_token = get_access_token(keyring_data)
+        user_info = fetch_user_info(access_token)
+        print("Auth data successfully retrieved.")
+        return user_info
+    except Exception as ex:
+        return str(ex), 400
 
 @app.route('/auth')
 def auth():
-  auth_url = (
-    f"{AUTHORIZATION_URL}?response_type=code"
-    f"&client_id={CLIENT_ID}"
-    f"&redirect_uri={REDIRECT_URI}"
-    f"&scope={SCOPE}"
-  )
-  return redirect(auth_url)
+    auth_url = (
+        f"{AUTHORIZATION_URL}?response_type=code"
+        f"&client_id={CLIENT_ID}"
+        f"&redirect_uri={REDIRECT_URI}"
+        f"&scope={SCOPE}"
+    )
+    return redirect(auth_url)
 
 @app.route('/auth/callback')
 def callback():
-  code = request.args.get('code')
-  if not code:
-    return "Error: No code provided", 400
+    code = request.args.get('code')
+    if not code:
+        return "Error: No authorization code provided", 400
 
-  token_data = {
-    'code': code,
-    'client_id': CLIENT_ID,
-    'client_secret': CLIENT_SECRET,
-    'redirect_uri': REDIRECT_URI,
-    'grant_type': 'authorization_code',
-  }
-  response = requests.post(TOKEN_URL, data=token_data)
+    try:
+        tokens = exchange_auth_code_for_tokens(code)
+        save_keyring_data(tokens)
+        return "Auth data successfully saved to keyring."
+    except Exception as ex:
+        return str(ex), 400
 
-  if response.status_code != 200:
-    return f"Error getting tokens: {response.status_code}", 400
+def exchange_auth_code_for_tokens(auth_code: str) -> dict[str, object]:
+    token_data = {
+        'client_id': CLIENT_ID,
+        'client_secret': CLIENT_SECRET,
+        'grant_type': 'authorization_code',
+        'code': auth_code,
+        'redirect_uri': REDIRECT_URI,
+    }
+    response = requests.post(TOKEN_URL, data=token_data)
+    response.raise_for_status()
+    return process_token_response(response)
 
-  token_info = response.json()
-  access_token = token_info.get('access_token')
-  if not access_token:
-    return "Error: No access token received", 400
-  
-  response = requests.get(USERINFO_URL, headers={'Authorization': f'Bearer {access_token}'})
-  if response.status_code != 200:
-    return f"Error getting user info: {response.status_code}", 400
-  
-  user_info = response.json()
-  ivao_vid = user_info.get('id')
-  if not ivao_vid:
-    return f"Error: No IVAO VID received", 400
-  
-  keyring_data = {
-    'vid': ivao_vid,
-    'accessToken': access_token,
-    'expiresAt': (datetime.datetime.now() + datetime.timedelta(seconds=int(token_info.get('expires_in', 1200)))).isoformat(),
-    'refreshToken': token_info.get('refresh_token'),
-    'updatedAt': datetime.datetime.now().isoformat(),
-    'version': 1
-  }
-  keyring.set_password(KEYRING_APPNAME, str(ivao_vid), json.dumps(keyring_data))
-  return "Auth data has been saved to keyring"
+def refresh_access_token(refresh_token: str) -> dict[str, object]:
+    token_data = {
+        'client_id': CLIENT_ID,
+        'client_secret': CLIENT_SECRET,
+        'grant_type': 'refresh_token',
+        'refresh_token': refresh_token
+    }
+    response = requests.post(TOKEN_URL, data=token_data)
+    response.raise_for_status()
+    return process_token_response(response)
+
+def get_access_token(keyring_data: dict[str, object]) -> str:
+    expires_at = datetime.datetime.fromisoformat(keyring_data['expires_at'])
+    if expires_at < datetime.datetime.now():
+        print("Access token expired, refreshing...")
+        tokens = refresh_access_token(keyring_data['refresh_token'])
+        save_keyring_data(tokens)
+        print("New auth data saved to keyring.")
+        return tokens['access_token']
+    
+    print("Using valid access token.")
+    return keyring_data['access_token']
+
+def fetch_user_info(access_token: str) -> dict[str, object]:
+    response = requests.get(USERINFO_URL, headers={'Authorization': f'Bearer {access_token}'})
+    response.raise_for_status()
+    return response.json()
+
+def process_token_response(response: requests.Response) -> dict[str, object]:
+    token_data = response.json()
+    if 'access_token' not in token_data:
+        raise Exception("Error: Access token not received.")
+    
+    expires_at = datetime.datetime.now() + datetime.timedelta(seconds=token_data.get('expires_in', 1200))
+    return {
+        'vid': fetch_user_info(token_data['access_token']).get('id'),
+        'access_token': token_data['access_token'],
+        'refresh_token': token_data['refresh_token'],
+        'expires_at': expires_at.isoformat(),
+        'updated_at': datetime.datetime.now().isoformat(),
+    }
+
+def get_keyring_data(vid: str) -> dict[str, object]:
+    data = keyring.get_password(KEYRING_APPNAME, vid)
+    return json.loads(data) if data else {}
+
+def save_keyring_data(data: dict[str, object]):
+    keyring.set_password(KEYRING_APPNAME, str(data['vid']), json.dumps(data))
 
 def start_server():
-  webbrowser.open('http://localhost:51234')
-  app.run(debug=True, port=51234)
+    webbrowser.open('http://localhost:41234')
+    app.run(debug=True, port=41234)
 
 if __name__ == '__main__':
-  start_server()
+    start_server()
